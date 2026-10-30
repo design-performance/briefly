@@ -17,7 +17,10 @@ const APP_URL = 'https://briefly.app.br/app/';
 // Remetente do próprio domínio (autenticado no Brevo). O outlook.com não passa
 // na autenticação, o Brevo reescrevia para @brevosend.com e parte caía no spam.
 const REMETENTE = { name: 'Briefly', email: 'acesso@briefly.app.br' };
-const RESPONDER_PARA = 'joandersantos@outlook.com';
+// Respostas vão para o próprio domínio (encaminhado pelo Cloudflare Email Routing).
+const RESPONDER_PARA = 'acesso@briefly.app.br';
+// Acentos viram entidades HTML: chegam certos em qualquer leitor de email.
+const semAcentoQuebrado = (x) => String(x || '').replace(/[^\x00-\x7f]/gu, (c) => '&#' + c.codePointAt(0) + ';');
 const MAX_DEVICES = 2;
 
 // Cores da identidade nova (azul cobalto).
@@ -145,9 +148,9 @@ async function enviarEmail(env, { para, assunto, html }) {
     body: JSON.stringify({
       sender: REMETENTE,
       to: [{ email: para }],
-      replyTo: { email: RESPONDER_PARA },
+      replyTo: { email: RESPONDER_PARA, name: 'Briefly' },
       subject: assunto,
-      htmlContent: html,
+      htmlContent: semAcentoQuebrado(html),
     }),
   });
   if (!r.ok) {
@@ -918,7 +921,16 @@ async function acaoAdminLista(env, { key }) {
     const r = await env.DB.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(valor), 0) AS total FROM pagamentos WHERE processado_em >= ?').bind(new Date(Date.now() - 30 * 86400000).toISOString()).first();
     if (r) pagamentos30 = r;
   } catch (e) {}
-  return json({ ok: true, briefly: b.results || [], gestor: g.results || [], exportacoes7, pagamentos30 });
+  let pagamentos = [], exportacoes = [];
+  try {
+    const r = await env.DB.prepare('SELECT id, email, valor, creditos, origem, processado_em FROM pagamentos WHERE processado_em >= ? ORDER BY processado_em DESC LIMIT 2000').bind(new Date(Date.now() - 120 * 86400000).toISOString()).all();
+    pagamentos = r.results || [];
+  } catch (e) {}
+  try {
+    const r = await env.DB.prepare("SELECT substr(criado_em, 1, 10) AS dia, COUNT(*) AS n FROM exportacoes WHERE criado_em >= ? GROUP BY dia").bind(new Date(Date.now() - 60 * 86400000).toISOString()).all();
+    exportacoes = r.results || [];
+  } catch (e) {}
+  return json({ ok: true, briefly: b.results || [], gestor: g.results || [], exportacoes7, pagamentos30, pagamentos, exportacoes });
 }
 
 async function acaoAdminSalvar(env, p) {
@@ -1008,16 +1020,34 @@ async function acaoAdminModeloApagar(env, { key, id }) {
   return json({ ok: true });
 }
 
+function primeiroNome(email) {
+  const tok = String(email || '').toLowerCase().split('@')[0].split(/[._+\-0-9]+/).filter(Boolean)[0] || '';
+  const bloq = ['admin', 'contato', 'contact', 'oi', 'ola', 'info', 'financeiro', 'comercial', 'suporte', 'vendas', 'atendimento', 'noreply', 'studio', 'estudio', 'design', 'agencia', 'marketing', 'hello', 'hi', 'mail', 'email', 'teste', 'test'];
+  if (tok.length < 2 || tok.length > 11 || bloq.includes(tok)) return '';
+  return tok.charAt(0).toUpperCase() + tok.slice(1);
+}
+function planoNome(p) {
+  return ({ free: 'Grátis', teste: 'Teste grátis', pro: 'Pro', parceiro: 'Parceiro', admin: 'Admin', mensal: 'Mensal', anual: 'Anual' })[p] || (p || '');
+}
+// Frase pronta que respeita o plano: grátis fala em "propostas grátis", pago fala em créditos.
+function creditosTexto(u, app) {
+  if (app === 'gestor') return u.plano === 'teste' ? 'seu teste grátis até ' + (u.expira_em || '') : 'acesso liberado até ' + (u.expira_em || '');
+  const n = Number(u.creditos) || 0;
+  if (u.plano === 'free') return n > 0 ? n + (n === 1 ? ' proposta grátis' : ' propostas grátis') : 'nenhuma proposta grátis restante';
+  return n + (n === 1 ? ' crédito disponível' : ' créditos disponíveis');
+}
 // Troca {{nome}}, {{email}}, {{codigo}}, {{creditos}}, {{validade}}, {{link}} pelos dados de cada pessoa.
 function personalizar(txt, u, app) {
   const link = app === 'gestor'
     ? GE_APP_URL + '?codigo=' + encodeURIComponent(u.codigo || '')
     : APP_URL + '?c=' + encodeURIComponent(u.codigo || '');
-  const nome = String(u.email || '').split('@')[0].split(/[._-]/)[0];
   const mapa = {
-    nome: nome ? nome.charAt(0).toUpperCase() + nome.slice(1) : '',
+    nome: primeiroNome(u.email),
+    saudacao: primeiroNome(u.email) ? 'Oi, ' + primeiroNome(u.email) : 'Oi',
     email: u.email || '', codigo: u.codigo || '', creditos: String(u.creditos ?? ''),
     validade: u.expira_em || '', plano: u.plano || '', link,
+    creditos_texto: creditosTexto(u, app),
+    plano_nome: planoNome(u.plano),
   };
   return String(txt || '').replace(/\{\{\s*(\w+)\s*\}\}/g, (m, k) => (k in mapa ? mapa[k] : m));
 }
