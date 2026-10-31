@@ -138,7 +138,147 @@ function corpoEmail({ titulo, chapeu, texto, codigo, rodape, cor }) {
 <div style="font-size:12px;color:#aaa;margin-top:14px">O botão já leva seu acesso liberado. Não precisa digitar nada.</div></div>
 </div>
 <div style="border-top:1px solid #eee;padding:24px;text-align:center">
-<span style="font-size:12px;color:#aaa">Briefly - Propostas com IA para quem vive de projetos</span></div></div>`;
+<span style="font-size:12px;color:#aaa">Briefly - Propostas para quem vive de projetos</span></div></div>`;
+}
+
+// ---------- proposta por link (o cliente vê e aprova) ----------
+const LINK_URL = 'https://briefly.app.br/p/?';
+const WORKER_URL = 'https://restless-cherry-a5e5prabriefly-api.joandersantos.workers.dev';
+const OG_PADRAO = 'https://briefly.app.br/og-briefly.png';
+const LINK_DIAS = 60;
+const LINK_SO_PAGO = true; // false libera o link também no plano grátis
+let linkTabelaOk = false;
+async function linkTabela(env) {
+  if (linkTabelaOk) return;
+  await env.DB.prepare('CREATE TABLE IF NOT EXISTS propostas_link (id TEXT PRIMARY KEY, codigo TEXT, email_prof TEXT, dados TEXT, versao INTEGER DEFAULT 1, status TEXT, criado_em TEXT, atualizado_em TEXT, visto_em TEXT, aprovado_em TEXT, aprovado_nome TEXT, aprovado_email TEXT, ajuste_texto TEXT, ajuste_em TEXT, expira_em TEXT)').run();
+  for (const c of ['recusado_em TEXT', 'recusa_texto TEXT', 'aviso_ok INTEGER', 'aviso_erro TEXT']) { try { await env.DB.prepare('ALTER TABLE propostas_link ADD COLUMN ' + c).run(); } catch (e) {} }
+  linkTabelaOk = true;
+}
+// Página de prévia para WhatsApp/Instagram: robôs não rodam JS, então o título,
+// o texto e a imagem personalizados saem daqui, e a pessoa é levada à proposta.
+async function linkPrevia(env, id) {
+  await linkTabela(env);
+  const r = await env.DB.prepare('SELECT id, dados FROM propostas_link WHERE id = ?').bind(id).first();
+  const destino = LINK_URL + encodeURIComponent(id);
+  let d = {}; try { d = JSON.parse((r && r.dados) || '{}'); } catch (e) {}
+  const og = d.og || {};
+  const titulo = og.titulo || ('Sua proposta está pronta' + (d.designerName ? ' · ' + d.designerName : ''));
+  const texto = og.texto || ((d.projectTitle ? d.projectTitle + '. ' : '') + 'Toque para ver o escopo, as etapas e o investimento, e aprovar pelo celular.');
+  const img = (og.imagem || d.logoSrc) ? WORKER_URL + '/og/' + encodeURIComponent(id) : OG_PADRAO;
+  const html = '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>' + esc(titulo) + '</title>'
+    + '<meta property="og:type" content="website"><meta property="og:title" content="' + esc(titulo) + '"><meta property="og:description" content="' + esc(texto) + '">'
+    + '<meta property="og:image" content="' + img + '"><meta property="og:url" content="' + WORKER_URL + '/p/' + esc(id) + '"><meta name="twitter:card" content="summary_large_image"><meta name="robots" content="noindex">'
+    + '<meta http-equiv="refresh" content="0;url=' + destino + '"></head><body style="font-family:Arial,sans-serif;padding:40px;text-align:center"><a href="' + destino + '">Abrir a proposta</a><script>location.replace(' + JSON.stringify(destino) + ')<\/script></body></html>';
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' } });
+}
+async function linkImagem(env, id) {
+  await linkTabela(env);
+  const r = await env.DB.prepare('SELECT dados FROM propostas_link WHERE id = ?').bind(id).first();
+  let d = {}; try { d = JSON.parse((r && r.dados) || '{}'); } catch (e) {}
+  const src = (d.og && d.og.imagem) || d.logoSrc || '';
+  const m = String(src).match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
+  if (!m) return Response.redirect(OG_PADRAO, 302);
+  const bin = Uint8Array.from(atob(m[2]), (c) => c.charCodeAt(0));
+  return new Response(bin, { headers: { 'Content-Type': m[1], 'Cache-Control': 'public, max-age=86400' } });
+}
+function linkNovoId() {
+  const a = 'abcdefghjkmnpqrstuvwxyz23456789'; const b = new Uint8Array(12); crypto.getRandomValues(b);
+  return Array.from(b, (x) => a[x % a.length]).join('');
+}
+const esc = (t) => String(t == null ? '' : t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function linkPublico(r) {
+  let d = {}; try { d = JSON.parse(r.dados || '{}'); } catch (e) {}
+  return { ok: true, id: r.id, versao: r.versao, status: r.status, dados: d, aprovadoEm: r.aprovado_em, aprovadoNome: r.aprovado_nome, ajusteEm: r.ajuste_em, expirada: !!(r.expira_em && r.expira_em < new Date().toISOString()) };
+}
+async function linkSalvar(env, { code, id, dados }) {
+  await linkTabela(env);
+  const codigo = String(code || '').toUpperCase().trim();
+  const u = codigo ? await porCodigo(env.DB, codigo) : null;
+  if (!u) return json({ ok: false, motivo: 'Entre no Briefly de novo para gerar o link.' });
+  if (LINK_SO_PAGO && u.plano === 'free' && codigo !== 'BRIEFLY-ADMIN') return json({ ok: false, pro: true, motivo: 'O link com aprovação faz parte dos planos pagos.' });
+  const d = dados && typeof dados === 'object' ? dados : {};
+  if (d.logoSrc && String(d.logoSrc).length > 400000) d.logoSrc = '';
+  if (d.og && d.og.imagem && String(d.og.imagem).length > 450000) d.og.imagem = '';
+  const txt = JSON.stringify(d);
+  if (txt.length > 900000) return json({ ok: false, motivo: 'A proposta ficou grande demais. Tente com uma logo menor.' });
+  const agora = new Date().toISOString();
+  const expira = new Date(Date.now() + LINK_DIAS * 86400000).toISOString();
+  if (id) {
+    const r = await env.DB.prepare('SELECT * FROM propostas_link WHERE id = ? AND codigo = ?').bind(String(id), codigo).first();
+    if (r) {
+      await env.DB.prepare("UPDATE propostas_link SET dados = ?, versao = versao + 1, status = 'enviada', atualizado_em = ?, expira_em = ?, ajuste_texto = NULL WHERE id = ?").bind(txt, agora, expira, r.id).run();
+      return json({ ok: true, id: r.id, url: WORKER_URL + '/p/' + r.id, direto: LINK_URL + r.id, versao: (r.versao || 1) + 1 });
+    }
+  }
+  const novo = linkNovoId();
+  await env.DB.prepare("INSERT INTO propostas_link (id, codigo, email_prof, dados, versao, status, criado_em, atualizado_em, expira_em) VALUES (?, ?, ?, ?, 1, 'enviada', ?, ?, ?)").bind(novo, codigo, u.email, txt, agora, agora, expira).run();
+  return json({ ok: true, id: novo, url: WORKER_URL + '/p/' + novo, direto: LINK_URL + novo, versao: 1 });
+}
+async function linkVer(env, { id, espiar }) {
+  await linkTabela(env);
+  const r = await env.DB.prepare('SELECT * FROM propostas_link WHERE id = ?').bind(String(id || '')).first();
+  if (!r) return json({ ok: false, motivo: 'Proposta não encontrada.' });
+  if (!espiar && r.status === 'enviada') {
+    await env.DB.prepare("UPDATE propostas_link SET status = 'vista', visto_em = ? WHERE id = ?").bind(new Date().toISOString(), r.id).run();
+    r.status = 'vista';
+  }
+  return json(linkPublico(r));
+}
+async function linkAvisar(env, r, assunto, corpo) {
+  let para = r.email_prof;
+  if (!para) { try { const u = await porCodigo(env.DB, r.codigo); para = u && u.email; } catch (e) {} }
+  if (!para) { await env.DB.prepare('UPDATE propostas_link SET aviso_ok = 0, aviso_erro = ? WHERE id = ?').bind('sem email cadastrado', r.id).run(); return; }
+  const html = '<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;background:#ffffff;border:1px solid #eee;border-radius:16px;overflow:hidden">'
+    + '<div style="background:' + AZUL + ';color:#ffffff;padding:22px 24px;font-size:20px;font-weight:bold">' + esc(assunto) + '</div>'
+    + '<div style="padding:24px;color:#333;font-size:15px;line-height:1.6">' + corpo
+    + '<div style="margin-top:22px"><a href="' + APP_URL + '" style="background:#0e0d0c;color:#ffffff;text-decoration:none;padding:13px 24px;border-radius:999px;font-weight:bold;display:inline-block">Abrir o Briefly</a></div></div></div>';
+  try { await enviarEmail(env, { para, assunto, html }); await env.DB.prepare('UPDATE propostas_link SET aviso_ok = 1, aviso_erro = NULL WHERE id = ?').bind(r.id).run(); }
+  catch (e) { await env.DB.prepare('UPDATE propostas_link SET aviso_ok = 0, aviso_erro = ? WHERE id = ?').bind(String(e.message || e).slice(0, 200), r.id).run(); }
+}
+async function linkRecusar(env, { id, nome, texto }) {
+  await linkTabela(env);
+  const r = await env.DB.prepare('SELECT * FROM propostas_link WHERE id = ?').bind(String(id || '')).first();
+  if (!r) return json({ ok: false, motivo: 'Proposta não encontrada.' });
+  if (r.status === 'aprovada') return json({ ok: false, motivo: 'Esta proposta já foi aprovada.' });
+  const n = String(nome || '').trim().slice(0, 80), t = String(texto || '').trim().slice(0, 1000);
+  await env.DB.prepare("UPDATE propostas_link SET status = 'recusada', recusado_em = ?, recusa_texto = ? WHERE id = ?").bind(new Date().toISOString(), (n ? n + ': ' : '') + t, r.id).run();
+  let d = {}; try { d = JSON.parse(r.dados || '{}'); } catch (e) {}
+  await linkAvisar(env, r, 'Proposta recusada: ' + (d.projectTitle || 'sua proposta'), (n ? '<b>' + esc(n) + '</b> recusou' : 'O cliente recusou') + ' a proposta <b>' + esc(d.projectTitle || '') + '</b>.' + (t ? '<br><br>Motivo:<div style="background:#f7f6f3;border-radius:12px;padding:14px 16px;margin-top:6px">' + esc(t) + '</div>' : '') + '<br>Ela já aparece como recusada no seu painel.');
+  return json({ ok: true });
+}
+async function linkAprovar(env, { id, nome, email }) {
+  await linkTabela(env);
+  const r = await env.DB.prepare('SELECT * FROM propostas_link WHERE id = ?').bind(String(id || '')).first();
+  if (!r) return json({ ok: false, motivo: 'Proposta não encontrada.' });
+  if (r.expira_em && r.expira_em < new Date().toISOString()) return json({ ok: false, motivo: 'Esta proposta expirou. Peça uma nova ao profissional.' });
+  const n = String(nome || '').trim().slice(0, 80);
+  if (n.length < 2) return json({ ok: false, motivo: 'Digite seu nome para aprovar.' });
+  if (r.status === 'aprovada') return json({ ok: true, ja: true });
+  const agora = new Date().toISOString();
+  await env.DB.prepare("UPDATE propostas_link SET status = 'aprovada', aprovado_em = ?, aprovado_nome = ?, aprovado_email = ? WHERE id = ?").bind(agora, n, String(email || '').trim().slice(0, 120), r.id).run();
+  let d = {}; try { d = JSON.parse(r.dados || '{}'); } catch (e) {}
+  await linkAvisar(env, r, 'Proposta aprovada: ' + (d.projectTitle || 'sua proposta'), '<b>' + esc(n) + '</b> aprovou a proposta <b>' + esc(d.projectTitle || '') + '</b>' + (d.statFinal ? ' no valor de <b>' + esc(d.statFinal) + '</b>' : '') + '.' + (email ? '<br>Email do cliente: ' + esc(email) : '') + '<br><br>No Briefly, ela já aparece como aprovada no seu painel.');
+  return json({ ok: true });
+}
+async function linkAjuste(env, { id, nome, texto }) {
+  await linkTabela(env);
+  const r = await env.DB.prepare('SELECT * FROM propostas_link WHERE id = ?').bind(String(id || '')).first();
+  if (!r) return json({ ok: false, motivo: 'Proposta não encontrada.' });
+  const t = String(texto || '').trim().slice(0, 2000);
+  if (t.length < 3) return json({ ok: false, motivo: 'Escreva o que você gostaria de ajustar.' });
+  const agora = new Date().toISOString();
+  const n = String(nome || '').trim().slice(0, 80);
+  await env.DB.prepare("UPDATE propostas_link SET status = 'ajuste', ajuste_texto = ?, ajuste_em = ? WHERE id = ?").bind((n ? n + ': ' : '') + t, agora, r.id).run();
+  let d = {}; try { d = JSON.parse(r.dados || '{}'); } catch (e) {}
+  await linkAvisar(env, r, 'Pedido de ajuste: ' + (d.projectTitle || 'sua proposta'), (n ? '<b>' + esc(n) + '</b> pediu' : 'O cliente pediu') + ' um ajuste na proposta <b>' + esc(d.projectTitle || '') + '</b>:<br><br><div style="background:#f7f6f3;border-radius:12px;padding:14px 16px">' + esc(t).replace(/\n/g, '<br>') + '</div><br>Edite no Briefly e envie de novo pelo mesmo link: o cliente sempre vê a versão mais nova.');
+  return json({ ok: true });
+}
+async function linkStatus(env, { code }) {
+  await linkTabela(env);
+  const codigo = String(code || '').toUpperCase().trim();
+  if (!codigo) return json({ ok: false, itens: [] });
+  const rs = await env.DB.prepare("SELECT id, status, versao, criado_em, visto_em, aprovado_em, aprovado_nome, ajuste_texto, ajuste_em, recusado_em, recusa_texto, aviso_ok, aviso_erro, json_extract(dados, '$.projectTitle') AS titulo, json_extract(dados, '$.statFinal') AS valor FROM propostas_link WHERE codigo = ? ORDER BY criado_em DESC LIMIT 300").bind(codigo).all();
+  return json({ ok: true, itens: rs.results || [] });
 }
 
 async function enviarEmail(env, { para, assunto, html }) {
@@ -1501,6 +1641,11 @@ export default {
       }
     }
 
+    if (request.method === 'GET' && url.pathname.indexOf('/p/') === 0) return await linkPrevia(env, decodeURIComponent(url.pathname.slice(3)).split('/')[0].split('-').pop().replace(/[^a-z0-9]/gi, ''));
+    // Domínio próprio (ex: p.briefly.app.br/joander-santos-k7x92m): sem o /p/ no caminho.
+    if (request.method === 'GET' && url.hostname.indexOf('workers.dev') < 0 && /^\/[a-z0-9-]+$/i.test(url.pathname) && url.pathname.length > 8) return await linkPrevia(env, url.pathname.slice(1).split('-').pop().replace(/[^a-z0-9]/gi, ''));
+    if (request.method === 'GET' && url.pathname.indexOf('/og/') === 0) return await linkImagem(env, decodeURIComponent(url.pathname.slice(4)).replace(/[^a-z0-9]/gi, ''));
+
     if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
 
     let payload = {};
@@ -1537,6 +1682,12 @@ export default {
         case 'ge-entrar':      return await geEntrar(env, payload);
         case 'ge-login-token': return await geLoginToken(env, payload);
         case 'ge-validate':    return await geValidate(env, payload);
+        case 'link-salvar':    return await linkSalvar(env, payload);
+        case 'link-ver':       return await linkVer(env, payload);
+        case 'link-aprovar':   return await linkAprovar(env, payload);
+        case 'link-ajuste':    return await linkAjuste(env, payload);
+        case 'link-recusar':   return await linkRecusar(env, payload);
+        case 'link-status':    return await linkStatus(env, payload);
         default:           return json({ error: 'Ação desconhecida: ' + acao }, 400);
       }
     } catch (e) {
