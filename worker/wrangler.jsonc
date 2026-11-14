@@ -2,16 +2,14 @@
 // Cuidados para não apagar nada do que já existe no painel:
 // - keep_vars: mantém as variáveis criadas no painel (segredos nunca são apagados)
 // - sem "triggers": o agendamento (cron) que já existe continua igual
-// - "routes": o domínio próprio que já existe no painel, declarado para continuar igual
+// - sem "routes": o domínio próprio (suapropostaestapronta.briefly.app.br) fica como está no painel;
+//   o Wrangler só mexe em domínios que estiverem listados aqui
 {
   "name": "restless-cherry-a5e5prabriefly-api",
   "main": "briefly-worker.js",
   "compatibility_date": "2026-09-01",
   "workers_dev": true,
   "keep_vars": true,
-  "routes": [
-    { "pattern": "suapropostaestapronta.briefly.app.br", "custom_domain": true }
-  ],
   "d1_databases": [
     { "binding": "DB", "database_name": "briefly", "database_id": "ffee136d-c02e-4b28-aae6-c3dad93e0bd9" }
   ]

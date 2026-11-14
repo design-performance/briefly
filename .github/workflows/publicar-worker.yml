@@ -36,4 +36,4 @@ jobs:
           T=$(printf '%s' "$CHAVE" | grep -oE '(Bearer[[:space:]]+|TOKEN=)[A-Za-z0-9_-]{20,}' | grep -oE '[A-Za-z0-9_-]{20,}$' | head -1 || true)
           if [ -z "$T" ]; then T=$(printf '%s' "$CHAVE" | grep -oE '[A-Za-z0-9_-]{30,}' | head -1 || true); fi
           export CLOUDFLARE_API_TOKEN="$T"
-          npx --yes wrangler@4.162.0 deploy
+          npx --yes wrangler@4.162.0 deploy || { echo "--- detalhes do erro ---"; tail -n 40 ~/.config/.wrangler/logs/*.log | grep -vi "token\|authorization"; exit 1; }
