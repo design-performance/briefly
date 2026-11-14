@@ -1,0 +1,15 @@
+// Configuração do Worker do Briefly para o deploy automático (Cloudflare Builds).
+// Cuidados para não apagar nada do que já existe no painel:
+// - keep_vars: mantém as variáveis criadas no painel (segredos nunca são apagados)
+// - sem "triggers": o agendamento (cron) que já existe continua igual
+// - sem "routes": domínios e rotas do painel não são mexidos
+{
+  "name": "restless-cherry-a5e5prabriefly-api",
+  "main": "briefly-worker.js",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "keep_vars": true,
+  "d1_databases": [
+    { "binding": "DB", "database_name": "briefly", "database_id": "ffee136d-c02e-4b28-aae6-c3dad93e0bd9" }
+  ]
+}
