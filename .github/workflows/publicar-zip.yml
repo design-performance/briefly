@@ -1,0 +1,65 @@
+name: Publicar zip
+
+# Envie um .zip pelo "Add file > Upload files" do GitHub.
+# Este robô descompacta, substitui os arquivos do site e apaga o zip.
+# Regra: o que estiver dentro da pasta "briefly-site/" vai para a raiz do site;
+# as outras pastas do zip (ex: "worker/") entram com o mesmo nome.
+# Nada é apagado do site: só os arquivos que vieram no zip são substituídos.
+
+on:
+  push:
+    paths:
+      - '**.zip'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publicar-zip
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descompactar e substituir
+        run: |
+          set -euo pipefail
+          shopt -s nullglob globstar dotglob
+          zips=( **/*.zip )
+          if [ ${#zips[@]} -eq 0 ]; then echo "Nenhum zip."; exit 0; fi
+          for z in "${zips[@]}"; do
+            echo "Publicando $z"
+            tmp=$(mktemp -d)
+            unzip -o -q "$z" -d "$tmp"
+            rm -rf "$tmp/__MACOSX"
+            find "$tmp" -name '.DS_Store' -delete
+            # Zip com uma pasta só por fora (ex: "pacote/"): entra nela.
+            itens=( "$tmp"/* )
+            raiz="$tmp"
+            if [ ${#itens[@]} -eq 1 ] && [ -d "${itens[0]}" ] && [ "$(basename "${itens[0]}")" != "briefly-site" ]; then raiz="${itens[0]}"; fi
+            # Segurança: o zip nunca mexe na pasta .github nem no .git.
+            rm -rf "$raiz/.github" "$raiz/.git" "$raiz/briefly-site/.github" "$raiz/briefly-site/.git"
+            # Conteúdo de briefly-site/ vai para a raiz do site.
+            if [ -d "$raiz/briefly-site" ]; then
+              cp -a "$raiz/briefly-site/." .
+              rm -rf "$raiz/briefly-site"
+            fi
+            # O resto entra como está.
+            if [ -n "$(ls -A "$raiz")" ]; then cp -a "$raiz/." .; fi
+            git rm -q --cached "$z" || true
+            rm -f "$z"
+            rm -rf "$tmp"
+          done
+
+      - name: Salvar no site
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "Nada mudou."; exit 0; fi
+          git commit -m "Publica o zip enviado"
+          git push
