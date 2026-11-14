@@ -37,4 +37,8 @@ jobs:
           if [ -z "$T" ]; then T=$(printf '%s' "$CHAVE" | grep -oE '[A-Za-z0-9_-]{30,}' | head -1 || true); fi
           echo "Chave com ${#T} caracteres."
           export CLOUDFLARE_API_TOKEN="$T"
+          echo "Conferindo a chave:"
+          curl -s "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify" -H "Authorization: Bearer $T" | head -c 300; echo
+          curl -s "https://api.cloudflare.com/client/v4/user/tokens/verify" -H "Authorization: Bearer $T" | head -c 300; echo
+          echo "Prefixo: ${T:0:5}"
           npx --yes wrangler@4.162.0 deploy
