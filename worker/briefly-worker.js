@@ -649,7 +649,7 @@ async function acaoValidate(env, { code, device }) {
 }
 
 // Debita ou devolve um crédito. É aqui que a fraude para.
-async function acaoSpend(env, { code, refund }) {
+async function acaoSpend(env, { code, refund, _ip }) {
   const codigo = String(code || '').toUpperCase().trim();
   const u = await porCodigo(env.DB, codigo);
   if (!u) return json({ ok: false, motivo: 'Código inválido.', credits: 0 });
@@ -679,7 +679,7 @@ async function acaoSpend(env, { code, refund }) {
   if (!deb.meta || deb.meta.changes === 0) return json({ ok: false, motivo: '', credits: 0 });
   let novo = u.creditos - 1;
   const ticket = linkNovoId();
-  await env.DB.prepare("INSERT INTO debitos (id, codigo, criado_em, estado) VALUES (?, ?, ?, 'aberto')").bind(ticket, codigo, Math.floor(Date.now() / 1000)).run();
+  await env.DB.prepare("INSERT INTO debitos (id, codigo, criado_em, estado, ip) VALUES (?, ?, ?, 'aberto', ?)").bind(ticket, codigo, Math.floor(Date.now() / 1000), String(_ip || '')).run();
 
   // Fidelidade: só para quem já comprou. Gastou 5 no mês, ganha +2 (uma vez por mês).
   const fid = await fidelidade(env, u, +1);
@@ -697,6 +697,7 @@ let debTabelaOk = false;
 async function debTabela(env) {
   if (debTabelaOk) return;
   await env.DB.prepare('CREATE TABLE IF NOT EXISTS debitos (id TEXT PRIMARY KEY, codigo TEXT, criado_em INTEGER, estado TEXT)').run();
+  try { await env.DB.prepare('ALTER TABLE debitos ADD COLUMN ip TEXT').run(); } catch (e) {}
   debTabelaOk = true;
 }
 // Devolve o crédito de um débito, uma vez só. Retorna o saldo novo ou null.
@@ -975,7 +976,14 @@ async function acaoGenerate(env, payload) {
 
   // Gerar exige código ativo e um crédito. Antes o servidor gerava para
   // qualquer um que chamasse direto, e a conta da geração ficava com você.
-  const codigo = String(payload.code || '').toUpperCase().trim();
+  let codigo = String(payload.code || '').toUpperCase().trim();
+  await debTabela(env);
+  // Versões do app que não mandam o código: vale o crédito que acabou de ser
+  // debitado pelo mesmo aparelho (mesmo IP) nos últimos 5 minutos.
+  if (!codigo && payload._ip) {
+    const d = await env.DB.prepare("SELECT codigo FROM debitos WHERE ip = ? AND estado = 'aberto' AND criado_em > ? ORDER BY criado_em DESC LIMIT 1").bind(payload._ip, Math.floor(Date.now() / 1000) - 300).first();
+    if (d) codigo = d.codigo;
+  }
   const u = codigo ? await porCodigo(env.DB, codigo) : null;
   if (!u) return json({ error: 'Entre no Briefly de novo para gerar a proposta.' }, 401);
   if (u.status !== 'ativo') return json({ error: 'Este código foi bloqueado.' }, 403);
@@ -2043,6 +2051,9 @@ export default {
     } catch (e) {
       return json({ error: 'Corpo inválido.' }, 400);
     }
+
+    // IP de quem chamou, dado pela Cloudflare (sobrescreve qualquer valor vindo no corpo).
+    payload._ip = request.headers.get('CF-Connecting-IP') || '';
 
     // Compatibilidade: chamada antiga do Gemini, sem campo action
     const acao = payload.action || (payload.audio ? 'transcribe' : 'generate');
