@@ -298,7 +298,7 @@ async function waProcessar(env, msg, nomePerfil) {
 
   const resumo = '*' + P.projectTitle + '*' + (valor ? '\nInvestimento: ' + valor : '') + '\n\n' + P.catResumo.slice(0, 600);
   if (linkId) {
-    return waEnviar(env, tel, 'Proposta pronta!\n\n' + resumo + '\n\nLink para o cliente ver e aprovar:\n' + WORKER_URL + '/p/' + linkId + '\n\nQuer ajustar antes? Abra em https://briefly.app.br/app , em Minhas propostas.\nCréditos restantes: ' + sp.credits);
+    return waEnviar(env, tel, 'Proposta pronta!\n\n' + resumo + '\n\nLink para o cliente ver e aprovar:\n' + LINK_PUBLICO + '/p/' + linkId + '\n\nQuer ajustar antes? Abra em https://briefly.app.br/app , em Minhas propostas.\nCréditos restantes: ' + sp.credits);
   }
   return waEnviar(env, tel, 'Proposta pronta!\n\n' + resumo + '\n\nA proposta completa, com escopo, etapas e PDF, já está em Minhas propostas: https://briefly.app.br/app\nNos planos pagos você recebe aqui o link para o cliente aprovar pelo celular.\nCréditos restantes: ' + sp.credits);
 }
@@ -352,6 +352,8 @@ async function histSalvar(env, { code, itens }) {
 // ---------- proposta por link (o cliente vê e aprova) ----------
 const LINK_URL = 'https://briefly.app.br/p/?';
 const WORKER_URL = 'https://restless-cherry-a5e5prabriefly-api.joandersantos.workers.dev';
+// Endereço que o cliente vê no link (domínio próprio ligado a este Worker).
+const LINK_PUBLICO = 'https://suapropostaestapronta.briefly.app.br';
 const OG_PADRAO = 'https://briefly.app.br/og-proposta.png';
 const LINK_DIAS = 60;
 const LINK_SO_PAGO = true; // false libera o link sem limite também no plano grátis
@@ -376,7 +378,7 @@ async function linkPrevia(env, id) {
   const img = /^https:\/\//.test(og.imagem || '') ? og.imagem : OG_PADRAO;
   const html = '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>' + esc(titulo) + '</title>'
     + '<meta property="og:type" content="website"><meta property="og:title" content="' + esc(titulo) + '"><meta property="og:description" content="' + esc(texto) + '">'
-    + '<meta property="og:image" content="' + esc(img) + '"><meta property="og:url" content="' + WORKER_URL + '/p/' + esc(id) + '"><meta name="twitter:card" content="summary_large_image"><meta name="robots" content="noindex">'
+    + '<meta property="og:image" content="' + esc(img) + '"><meta property="og:url" content="' + LINK_PUBLICO + '/p/' + esc(id) + '"><meta name="twitter:card" content="summary_large_image"><meta name="robots" content="noindex">'
     + '<meta http-equiv="refresh" content="0;url=' + destino + '"></head><body style="font-family:Arial,sans-serif;padding:40px;text-align:center"><a href="' + destino + '">Abrir a proposta</a><script>location.replace(' + JSON.stringify(destino) + ')<\/script></body></html>';
   return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' } });
 }
@@ -424,12 +426,12 @@ async function linkSalvar(env, { code, id, dados }) {
     const r = await env.DB.prepare('SELECT * FROM propostas_link WHERE id = ? AND codigo = ?').bind(String(id), codigo).first();
     if (r) {
       await env.DB.prepare("UPDATE propostas_link SET dados = ?, versao = versao + 1, status = 'enviada', atualizado_em = ?, expira_em = ?, ajuste_texto = NULL WHERE id = ?").bind(txt, agora, expira, r.id).run();
-      return json({ ok: true, id: r.id, url: WORKER_URL + '/p/' + r.id, direto: LINK_URL + r.id, versao: (r.versao || 1) + 1, gratisRestantes });
+      return json({ ok: true, id: r.id, url: LINK_PUBLICO + '/p/' + r.id, direto: LINK_URL + r.id, versao: (r.versao || 1) + 1, gratisRestantes });
     }
   }
   const novo = linkNovoId();
   await env.DB.prepare("INSERT INTO propostas_link (id, codigo, email_prof, dados, versao, status, criado_em, atualizado_em, expira_em) VALUES (?, ?, ?, ?, 1, 'enviada', ?, ?, ?)").bind(novo, codigo, u.email, txt, agora, agora, expira).run();
-  return json({ ok: true, id: novo, url: WORKER_URL + '/p/' + novo, direto: LINK_URL + novo, versao: 1, gratisRestantes });
+  return json({ ok: true, id: novo, url: LINK_PUBLICO + '/p/' + novo, direto: LINK_URL + novo, versao: 1, gratisRestantes });
 }
 async function linkVer(env, { id, espiar }) {
   await linkTabela(env);
