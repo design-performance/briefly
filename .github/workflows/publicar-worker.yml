@@ -41,4 +41,5 @@ jobs:
           curl -s "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify" -H "Authorization: Bearer $T" | head -c 300; echo
           curl -s "https://api.cloudflare.com/client/v4/user/tokens/verify" -H "Authorization: Bearer $T" | head -c 300; echo
           echo "Prefixo: ${T:0:5}"
+          echo "Texto guardado: ${#CHAVE} caracteres, $(printf '%s' "$CHAVE" | wc -l) quebras de linha. Símbolos: $(printf '%s' "$CHAVE" | tr -d 'A-Za-z0-9' | fold -w1 | sort -u | tr -d '\n' | head -c 40)"
           npx --yes wrangler@4.162.0 deploy
