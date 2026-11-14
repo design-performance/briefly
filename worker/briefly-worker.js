@@ -354,7 +354,8 @@ const LINK_URL = 'https://briefly.app.br/p/?';
 const WORKER_URL = 'https://restless-cherry-a5e5prabriefly-api.joandersantos.workers.dev';
 const OG_PADRAO = 'https://briefly.app.br/og-proposta.png';
 const LINK_DIAS = 60;
-const LINK_SO_PAGO = true; // false libera o link também no plano grátis
+const LINK_SO_PAGO = true; // false libera o link sem limite também no plano grátis
+const LINK_GRATIS = 2;     // links com aprovação que o plano grátis pode criar (para conhecer a função)
 let linkTabelaOk = false;
 async function linkTabela(env) {
   if (linkTabelaOk) return;
@@ -403,7 +404,15 @@ async function linkSalvar(env, { code, id, dados }) {
   const codigo = String(code || '').toUpperCase().trim();
   const u = codigo ? await porCodigo(env.DB, codigo) : null;
   if (!u) return json({ ok: false, motivo: 'Entre no Briefly de novo para gerar o link.' });
-  if (LINK_SO_PAGO && u.plano === 'free' && codigo !== 'BRIEFLY-ADMIN') return json({ ok: false, pro: true, motivo: 'O link com aprovação faz parte dos planos pagos.' });
+  // Plano grátis: pode criar LINK_GRATIS links para conhecer a aprovação pelo cliente.
+  // Atualizar um link que já existe não conta como novo.
+  let gratisRestantes = null;
+  if (LINK_SO_PAGO && u.plano === 'free' && codigo !== 'BRIEFLY-ADMIN') {
+    const existe = id ? await env.DB.prepare('SELECT id FROM propostas_link WHERE id = ? AND codigo = ?').bind(String(id), codigo).first() : null;
+    const usados = (await env.DB.prepare('SELECT COUNT(*) AS n FROM propostas_link WHERE codigo = ?').bind(codigo).first() || {}).n || 0;
+    if (!existe && usados >= LINK_GRATIS) return json({ ok: false, pro: true, motivo: 'Você já usou seus ' + LINK_GRATIS + ' links grátis com aprovação. Nos planos pagos o link é ilimitado.' });
+    gratisRestantes = Math.max(0, LINK_GRATIS - usados - (existe ? 0 : 1));
+  }
   const d = dados && typeof dados === 'object' ? dados : {};
   if (d.logoSrc && String(d.logoSrc).length > 400000) d.logoSrc = '';
   if (d.og && d.og.imagem && String(d.og.imagem).length > 450000) d.og.imagem = '';
@@ -415,12 +424,12 @@ async function linkSalvar(env, { code, id, dados }) {
     const r = await env.DB.prepare('SELECT * FROM propostas_link WHERE id = ? AND codigo = ?').bind(String(id), codigo).first();
     if (r) {
       await env.DB.prepare("UPDATE propostas_link SET dados = ?, versao = versao + 1, status = 'enviada', atualizado_em = ?, expira_em = ?, ajuste_texto = NULL WHERE id = ?").bind(txt, agora, expira, r.id).run();
-      return json({ ok: true, id: r.id, url: WORKER_URL + '/p/' + r.id, direto: LINK_URL + r.id, versao: (r.versao || 1) + 1 });
+      return json({ ok: true, id: r.id, url: WORKER_URL + '/p/' + r.id, direto: LINK_URL + r.id, versao: (r.versao || 1) + 1, gratisRestantes });
     }
   }
   const novo = linkNovoId();
   await env.DB.prepare("INSERT INTO propostas_link (id, codigo, email_prof, dados, versao, status, criado_em, atualizado_em, expira_em) VALUES (?, ?, ?, ?, 1, 'enviada', ?, ?, ?)").bind(novo, codigo, u.email, txt, agora, agora, expira).run();
-  return json({ ok: true, id: novo, url: WORKER_URL + '/p/' + novo, direto: LINK_URL + novo, versao: 1 });
+  return json({ ok: true, id: novo, url: WORKER_URL + '/p/' + novo, direto: LINK_URL + novo, versao: 1, gratisRestantes });
 }
 async function linkVer(env, { id, espiar }) {
   await linkTabela(env);
@@ -1364,7 +1373,24 @@ async function acaoAdminLista(env, { key }) {
     const r = await env.DB.prepare("SELECT substr(criado_em, 1, 10) AS dia, COUNT(*) AS n FROM exportacoes WHERE criado_em >= ? GROUP BY dia").bind(new Date(Date.now() - 60 * 86400000).toISOString()).all();
     exportacoes = r.results || [];
   } catch (e) {}
-  return json({ ok: true, briefly: b.results || [], gestor: g.results || [], exportacoes7, pagamentos30, pagamentos, exportacoes });
+  // Jornada da proposta por link: quem mandou, se o cliente abriu, aprovou, pediu ajuste ou recusou.
+  let jornada = null;
+  try {
+    await linkTabela(env);
+    const tres = new Date(Date.now() - 3 * 86400000).toISOString();
+    jornada = await env.DB.prepare(`SELECT
+        COUNT(DISTINCT codigo) AS usuariosLink,
+        COUNT(DISTINCT CASE WHEN visto_em IS NOT NULL OR status IN ('vista','aprovada','ajuste','recusada') THEN codigo END) AS usuariosViram,
+        COUNT(DISTINCT CASE WHEN status = 'aprovada' THEN codigo END) AS usuariosAprovaram,
+        COUNT(*) AS links,
+        SUM(CASE WHEN visto_em IS NOT NULL OR status IN ('vista','aprovada','ajuste','recusada') THEN 1 ELSE 0 END) AS vistos,
+        SUM(CASE WHEN status = 'aprovada' THEN 1 ELSE 0 END) AS aprovados,
+        SUM(CASE WHEN status = 'ajuste' THEN 1 ELSE 0 END) AS ajustes,
+        SUM(CASE WHEN status = 'recusada' THEN 1 ELSE 0 END) AS recusados,
+        SUM(CASE WHEN status = 'vista' AND visto_em < ? THEN 1 ELSE 0 END) AS semResposta
+      FROM propostas_link`).bind(tres).first();
+  } catch (e) {}
+  return json({ ok: true, briefly: b.results || [], gestor: g.results || [], exportacoes7, pagamentos30, pagamentos, exportacoes, jornada });
 }
 
 async function acaoAdminSalvar(env, p) {
