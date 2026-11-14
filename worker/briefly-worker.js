@@ -362,7 +362,7 @@ let linkTabelaOk = false;
 async function linkTabela(env) {
   if (linkTabelaOk) return;
   await env.DB.prepare('CREATE TABLE IF NOT EXISTS propostas_link (id TEXT PRIMARY KEY, codigo TEXT, email_prof TEXT, dados TEXT, versao INTEGER DEFAULT 1, status TEXT, criado_em TEXT, atualizado_em TEXT, visto_em TEXT, aprovado_em TEXT, aprovado_nome TEXT, aprovado_email TEXT, ajuste_texto TEXT, ajuste_em TEXT, expira_em TEXT)').run();
-  for (const c of ['recusado_em TEXT', 'recusa_texto TEXT', 'aviso_ok INTEGER', 'aviso_erro TEXT']) { try { await env.DB.prepare('ALTER TABLE propostas_link ADD COLUMN ' + c).run(); } catch (e) {} }
+  for (const c of ['recusado_em TEXT', 'recusa_texto TEXT', 'aviso_ok INTEGER', 'aviso_erro TEXT', 'retomada_em TEXT']) { try { await env.DB.prepare('ALTER TABLE propostas_link ADD COLUMN ' + c).run(); } catch (e) {} }
   linkTabelaOk = true;
 }
 // Página de prévia para WhatsApp/Instagram: robôs não rodam JS, então o título,
@@ -399,9 +399,9 @@ function linkNovoId() {
 const esc = (t) => String(t == null ? '' : t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 function linkPublico(r) {
   let d = {}; try { d = JSON.parse(r.dados || '{}'); } catch (e) {}
-  return { ok: true, id: r.id, versao: r.versao, status: r.status, dados: d, aprovadoEm: r.aprovado_em, aprovadoNome: r.aprovado_nome, ajusteEm: r.ajuste_em, expirada: !!(r.expira_em && r.expira_em < new Date().toISOString()) };
+  return { ok: true, id: r.id, versao: r.versao, status: r.status, dados: d, aprovadoEm: r.aprovado_em, aprovadoNome: r.aprovado_nome, ajusteEm: r.ajuste_em, expiraEm: r.expira_em || null, expirada: !!(r.expira_em && r.expira_em < new Date().toISOString()) };
 }
-async function linkSalvar(env, { code, id, dados }) {
+async function linkSalvar(env, { code, id, dados, validadeDias }) {
   await linkTabela(env);
   const codigo = String(code || '').toUpperCase().trim();
   const u = codigo ? await porCodigo(env.DB, codigo) : null;
@@ -421,11 +421,14 @@ async function linkSalvar(env, { code, id, dados }) {
   const txt = JSON.stringify(d);
   if (txt.length > 900000) return json({ ok: false, motivo: 'A proposta ficou grande demais. Tente com uma logo menor.' });
   const agora = new Date().toISOString();
-  const expira = new Date(Date.now() + LINK_DIAS * 86400000).toISOString();
+  // Validade escolhida no app (7, 15 ou 30 dias); versões antigas do app ficam com LINK_DIAS.
+  const vd = Number(validadeDias);
+  const dias = vd >= 3 && vd <= 60 ? Math.round(vd) : LINK_DIAS;
+  const expira = new Date(Date.now() + dias * 86400000).toISOString();
   if (id) {
     const r = await env.DB.prepare('SELECT * FROM propostas_link WHERE id = ? AND codigo = ?').bind(String(id), codigo).first();
     if (r) {
-      await env.DB.prepare("UPDATE propostas_link SET dados = ?, versao = versao + 1, status = 'enviada', atualizado_em = ?, expira_em = ?, ajuste_texto = NULL WHERE id = ?").bind(txt, agora, expira, r.id).run();
+      await env.DB.prepare("UPDATE propostas_link SET dados = ?, versao = versao + 1, status = 'enviada', atualizado_em = ?, expira_em = ?, ajuste_texto = NULL, retomada_em = NULL WHERE id = ?").bind(txt, agora, expira, r.id).run();
       return json({ ok: true, id: r.id, url: LINK_PUBLICO + '/p/' + r.id, direto: LINK_URL + r.id, versao: (r.versao || 1) + 1, gratisRestantes });
     }
   }
@@ -1940,6 +1943,34 @@ async function varredura(env, horas) {
   return { ok: true, verificados: lista.length, recuperados };
 }
 
+// ---------- retomada: o cliente viu e não respondeu ----------
+// Uma vez por proposta: 3 dias depois de o cliente abrir sem aprovar, pedir
+// ajuste ou recusar, o profissional recebe um email com uma mensagem pronta.
+const RETOMADA_DIAS = 3;
+async function avisarSemResposta(env) {
+  await linkTabela(env);
+  const agora = Date.now();
+  const limite = new Date(agora - RETOMADA_DIAS * 86400000).toISOString();
+  const recente = new Date(agora - 14 * 86400000).toISOString();
+  const { results } = await env.DB.prepare("SELECT * FROM propostas_link WHERE status = 'vista' AND retomada_em IS NULL AND visto_em < ? AND visto_em > ? AND (expira_em IS NULL OR expira_em > ?) LIMIT 20")
+    .bind(limite, recente, new Date(agora).toISOString()).all();
+  let n = 0;
+  for (const r of results || []) {
+    // Marca antes de enviar: nunca manda duas vezes, mesmo se o email falhar.
+    const m = await env.DB.prepare('UPDATE propostas_link SET retomada_em = ? WHERE id = ? AND retomada_em IS NULL').bind(new Date().toISOString(), r.id).run();
+    if (!m.meta || m.meta.changes === 0) continue;
+    let d = {}; try { d = JSON.parse(r.dados || '{}'); } catch (e) {}
+    const visto = new Date(r.visto_em).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', timeZone: 'America/Sao_Paulo' });
+    const msg = 'Oi! Passando pra saber se ficou alguma dúvida na proposta' + (d.projectTitle ? ' de ' + d.projectTitle : '') + '. Se o prazo ou o valor apertou, eu consigo montar uma versão menor. Quer que eu te mande?';
+    const corpo = 'Seu cliente abriu a proposta <b>' + esc(d.projectTitle || '') + '</b> em ' + visto + ' e ainda não respondeu.'
+      + '<br><br>Muita gente some porque não sabe como dizer que ficou caro. Uma mensagem leve, que abre caminho, costuma destravar:'
+      + '<div style="background:#f7f6f3;border-radius:12px;padding:14px 16px;margin-top:10px;font-style:italic">' + esc(msg) + '</div>'
+      + '<br>Copie, ajuste do seu jeito e mande no WhatsApp do cliente.';
+    try { await linkAvisar(env, r, 'Seu cliente viu a proposta e ainda não respondeu', corpo); n++; } catch (e) {}
+  }
+  return n;
+}
+
 // Roteia a varredura para o gateway ativo.
 async function varrer(env, horas) {
   return GATEWAY === 'asaas'
@@ -2132,5 +2163,6 @@ export default {
   // webhook tenha perdido — rede de segurança do fluxo de cobrança.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(varrer(env, 24));
+    ctx.waitUntil(avisarSemResposta(env).catch(() => 0));
   },
 };
