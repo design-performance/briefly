@@ -141,10 +141,218 @@ function corpoEmail({ titulo, chapeu, texto, codigo, rodape, cor }) {
 <span style="font-size:12px;color:#aaa">Briefly - Propostas para quem vive de projetos</span></div></div>`;
 }
 
+// ---------- ManyChat (Instagram) ----------
+// Uma rota só, no mesmo servidor e no mesmo banco. Não cria outro cadastro:
+// usa o mesmo signup do site, então o código e o email são os de sempre.
+async function mcTabela(env) {
+  await env.DB.prepare('CREATE TABLE IF NOT EXISTS leads_ig (ig_id TEXT PRIMARY KEY, ig_usuario TEXT, nome TEXT, email TEXT, origem TEXT, status TEXT, criado_em TEXT, atualizado_em TEXT)').run();
+}
+async function rotaManychat(request, env) {
+  const chave = request.headers.get('X-Briefly-Key') || '';
+  if (!env.MANYCHAT_KEY || chave !== env.MANYCHAT_KEY) return json({ ok: false, status: 'erro', mensagem: 'Acesso negado.' }, 403);
+  let p = {}; try { p = await request.json(); } catch (e) {}
+  const igId = String(p.ig_id || '').replace(/[^0-9a-z_-]/gi, '').slice(0, 64);
+  const nome = String(p.nome || '').trim().split(/\s+/)[0].slice(0, 40);
+  const email = String(p.email || '').toLowerCase().trim();
+  const origem = String(p.origem || 'dm').slice(0, 30);
+  const link = 'https://briefly.app.br/app/?utm_source=instagram&utm_medium=dm&utm_campaign=' + encodeURIComponent(origem);
+  const agora = new Date().toISOString();
+  await mcTabela(env);
+  if (igId) {
+    await env.DB.prepare('INSERT INTO leads_ig (ig_id, ig_usuario, nome, email, origem, status, criado_em, atualizado_em) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ig_id) DO UPDATE SET ig_usuario = excluded.ig_usuario, nome = excluded.nome, email = COALESCE(NULLIF(excluded.email, \'\'), leads_ig.email), atualizado_em = excluded.atualizado_em')
+      .bind(igId, String(p.ig_usuario || '').slice(0, 60), nome, email, origem, 'lead', agora, agora).run();
+  }
+  if (p.acao !== 'cadastro') return json({ ok: true, status: 'lead', mensagem: '', link });
+  const r = await acaoSignup(env, { email, device: igId ? 'ig:' + igId : '' });
+  let d = {}; try { d = await r.json(); } catch (e) {}
+  const oi = nome ? nome + ', ' : '';
+  let status, mensagem;
+  if (d.ok && d.novo) { status = 'novo'; mensagem = 'Prontinho, ' + oi + 'seu acesso foi criado! O código chegou em ' + email + '. Se não aparecer em 2 minutos, olhe o spam ou a aba Promoções. Depois é só colar o código no Briefly.'; }
+  else if (d.ok) { status = 'existente'; mensagem = oi + 'você já tem cadastro com esse email. Reenviei o seu código para ' + email + '.'; }
+  else if (d.jaCadastrado) { status = 'ja_usou'; mensagem = 'Esta conta do Instagram já recebeu as propostas grátis. Se perdeu o código, entre no Briefly e toque em "Já tenho um código" para recebê-lo de novo.'; }
+  else { status = 'erro'; mensagem = (d.motivo || 'Não consegui cadastrar agora.') + ' Me manda o email de novo, por favor.'; }
+  if (igId) await env.DB.prepare('UPDATE leads_ig SET status = ?, atualizado_em = ? WHERE ig_id = ?').bind(status, agora, igId).run();
+  return json({ ok: status !== 'erro', status, mensagem, link });
+}
+
+// ---------- Briefly no WhatsApp ----------
+// O profissional encaminha a mensagem ou o áudio do cliente para o número do
+// Briefly e recebe a proposta pronta. Usa o mesmo cadastro, os mesmos créditos,
+// a mesma geração e o mesmo link com aprovação do app.
+let waTabelasOk = false;
+async function waTabelas(env) {
+  if (waTabelasOk) return;
+  await env.DB.prepare('CREATE TABLE IF NOT EXISTS wa_contas (telefone TEXT PRIMARY KEY, codigo TEXT, nome TEXT, criado_em TEXT, atualizado_em TEXT)').run();
+  await env.DB.prepare('CREATE TABLE IF NOT EXISTS wa_msgs (id TEXT PRIMARY KEY, criado_em TEXT)').run();
+  waTabelasOk = true;
+}
+async function waEnviar(env, para, texto) {
+  try {
+    await fetch('https://graph.facebook.com/v21.0/' + env.WA_PHONE_ID + '/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + env.WA_TOKEN },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to: para, type: 'text', text: { body: String(texto).slice(0, 4000), preview_url: true } }),
+    });
+  } catch (e) {}
+}
+async function waAssinaturaOk(request, env, corpo) {
+  if (!env.WA_APP_SECRET) return false; // sem a chave da Meta configurada, ninguém entra por aqui
+  const sig = request.headers.get('X-Hub-Signature-256') || '';
+  const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.WA_APP_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(corpo));
+  const hex = Array.from(new Uint8Array(mac), (b) => b.toString(16).padStart(2, '0')).join('');
+  return sig === 'sha256=' + hex;
+}
+async function waBaixarAudio(env, mediaId) {
+  const m = await (await fetch('https://graph.facebook.com/v21.0/' + mediaId, { headers: { Authorization: 'Bearer ' + env.WA_TOKEN } })).json();
+  if (!m || !m.url) throw new Error('sem url');
+  const r = await fetch(m.url, { headers: { Authorization: 'Bearer ' + env.WA_TOKEN } });
+  const b = new Uint8Array(await r.arrayBuffer());
+  if (b.length > 15 * 1024 * 1024) throw new Error('grande');
+  let s = ''; for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  return { data: btoa(s), mimeType: (m.mime_type || 'audio/ogg').split(';')[0] };
+}
+function waPartes(result) {
+  let parts;
+  if (result.includes('---SEP---')) parts = result.split('---SEP---');
+  else { parts = result.split(/BLOCO\s*\d+\s*[-–—:]\s*/i).filter((p) => p.trim()); if (parts.length < 3) parts = result.split(/\n(?=\d+\s*[-–—.]\s*[A-ZÁÉÍÓÚÀÃÕÇ])/i); }
+  parts = parts.map((p) => p.replace(/^(TÍTULO DO PROJETO|RESUMO DO PROJETO|ESCOPO E ENTREGÁVEIS|PRAZO E ETAPAS|INVESTIMENTO|O QUE NÃO ESTÁ INCLUÍDO|PERGUNTAS PARA O CLIENTE)\s*[:\n]*/i, '').trim());
+  return { projectTitle: (parts[0] || 'Proposta').trim().slice(0, 140), catResumo: (parts[1] || '').trim(), catEscopo: (parts[2] || '').trim(), catTimeline: (parts[3] || '').trim(), catInvestimento: (parts[4] || '').trim(), catExcluido: (parts[5] || '').trim(), catPerguntas: (parts[6] || '').trim() };
+}
+function waValorFinal(inv) {
+  const l = String(inv || '').split('\n').map((x) => x.trim()).filter(Boolean);
+  const f = l.find((x) => /^(valor\s+)?final|^total/i.test(x.replace(/^[-•*]\s*/, '')));
+  const m = (f || l[l.length - 1] || '').match(/R\$\s*[\d.,]+/);
+  return m ? m[0] : '';
+}
+async function waProcessar(env, msg, nomePerfil) {
+  const tel = String(msg.from || '');
+  if (!tel) return;
+  await waTabelas(env);
+  const agora = new Date().toISOString();
+  const dup = await env.DB.prepare('INSERT OR IGNORE INTO wa_msgs (id, criado_em) VALUES (?, ?)').bind(String(msg.id || tel + agora), agora).run();
+  if (dup.meta && dup.meta.changes === 0) return;
+  const texto = msg.type === 'text' ? String((msg.text && msg.text.body) || '').trim() : '';
+  const conta = await env.DB.prepare('SELECT * FROM wa_contas WHERE telefone = ?').bind(tel).first();
+
+  const cod = texto.toUpperCase().match(/\b(?:FREE|PRO|BRIEFLY)-[A-Z0-9-]{3,}\b/);
+  if (cod) {
+    const u = await porCodigo(env.DB, cod[0]);
+    if (!u) return waEnviar(env, tel, 'Não encontrei esse código. Confira no email de cadastro do Briefly e mande de novo.');
+    if (u.status !== 'ativo') return waEnviar(env, tel, 'Esse código está bloqueado. Fale com acesso@briefly.app.br.');
+    await env.DB.prepare('INSERT INTO wa_contas (telefone, codigo, nome, criado_em, atualizado_em) VALUES (?, ?, ?, ?, ?) ON CONFLICT(telefone) DO UPDATE SET codigo = excluded.codigo, nome = excluded.nome, atualizado_em = excluded.atualizado_em').bind(tel, u.codigo, String(nomePerfil || '').slice(0, 80), agora, agora).run();
+    return waEnviar(env, tel, 'Pronto, WhatsApp conectado ao seu Briefly! Você tem ' + u.creditos + ' créditos.\n\nAgora é só encaminhar aqui a mensagem ou o áudio do cliente. Comece com "Orçamento de" se quiser, por exemplo: "Orçamento de ensaio de casamento, 8 horas".');
+  }
+  if (!conta) return waEnviar(env, tel, 'Oi! Aqui é o Briefly. Para eu montar suas propostas por aqui, me mande o seu código de acesso (ele está no email de cadastro).\n\nAinda não tem? Crie grátis, com 5 propostas: https://briefly.app.br/app/?utm_source=whatsapp');
+  if (/^(ajuda|menu|oi|olá|ola|bom dia|boa tarde|boa noite)\b/i.test(texto) && texto.length < 30) return waEnviar(env, tel, 'É só encaminhar aqui a mensagem ou o áudio do cliente que eu devolvo a proposta pronta, com escopo, etapas e investimento.\n\nPara ver o saldo, mande SALDO.');
+
+  const u = await porCodigo(env.DB, conta.codigo);
+  if (!u || u.status !== 'ativo') return waEnviar(env, tel, 'Seu acesso não está ativo. Entre em https://briefly.app.br/app para conferir.');
+  if (/^saldo\b/i.test(texto)) return waEnviar(env, tel, 'Você tem ' + u.creditos + ' créditos. Comprar mais: https://briefly.app.br/app');
+
+  let briefing = texto;
+  if (msg.type === 'audio') {
+    await waEnviar(env, tel, 'Ouvindo o áudio…');
+    try {
+      const a = await waBaixarAudio(env, msg.audio.id);
+      const tr = await (await acaoTranscribe(env, { audio: a })).json();
+      briefing = String(tr.text || '').trim();
+    } catch (e) { briefing = ''; }
+    if (!briefing || briefing.indexOf('[sem áudio detectado]') > -1) return waEnviar(env, tel, 'Não consegui entender esse áudio. Pode mandar de novo ou escrever o pedido?');
+  } else if (msg.type !== 'text') {
+    return waEnviar(env, tel, 'Por enquanto eu entendo texto e áudio. Encaminhe a mensagem ou o áudio do cliente.');
+  }
+  if (briefing.length < 20) return waEnviar(env, tel, 'Me conta um pouco mais do pedido: o que o cliente quer, prazo, quantidade, local… Quanto mais detalhe, melhor a proposta.');
+
+  const sp = await (await acaoSpend(env, { code: u.codigo })).json();
+  if (!sp.ok) return waEnviar(env, tel, 'Seus créditos acabaram. Compre mais em https://briefly.app.br/app e volte aqui.');
+  await waEnviar(env, tel, 'Recebi! Montando sua proposta… leva uns 20 segundos.');
+
+  const orc = (briefing.match(/^or[cç]amento de\s*:?\s*([^\n.]{3,90})/i) || [])[1] || '';
+  const gr = await acaoGenerate(env, { code: u.codigo, clientMessage: briefing, orcamentoDe: orc, designerName: conta.nome || 'o profissional', designerRole: 'prestador de serviços', designerLevel: 'pleno' });
+  const g = await gr.json();
+  if (!g.text) {
+    await acaoSpend(env, { code: u.codigo, refund: true });
+    return waEnviar(env, tel, g.fora_escopo ? 'Eu monto propostas de orçamento a partir do pedido do cliente. Encaminhe a mensagem ou o áudio dele, por exemplo: "quero um ensaio estilo street, quanto fica?". Seu crédito foi devolvido.' : 'Tive um problema para montar agora. Seu crédito foi devolvido, tente de novo em instantes.');
+  }
+  const P = waPartes(g.text);
+  const valor = waValorFinal(P.catInvestimento);
+  const dataBr = new Date().toLocaleDateString('pt-BR', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'America/Sao_Paulo' });
+  const dados = Object.assign({}, P, { designerName: conta.nome || '', designerRole: '', brandColor: '#3b5bff', projectDate: dataBr, ocultos: {}, statFinal: valor, origem: 'whatsapp' });
+
+  let linkId = '';
+  const pago = u.plano !== 'free' || u.codigo === 'BRIEFLY-ADMIN';
+  if (pago) {
+    await linkTabela(env);
+    linkId = linkNovoId();
+    const exp = new Date(Date.now() + LINK_DIAS * 86400000).toISOString();
+    await env.DB.prepare("INSERT INTO propostas_link (id, codigo, email_prof, dados, versao, status, criado_em, atualizado_em, expira_em) VALUES (?, ?, ?, ?, 1, 'enviada', ?, ?, ?)").bind(linkId, u.codigo, u.email || '', JSON.stringify(dados), agora, agora, exp).run();
+  }
+  try {
+    await histTabela(env);
+    const r = await env.DB.prepare('SELECT dados FROM historico WHERE codigo = ?').bind(u.codigo).first();
+    let lista = []; try { lista = JSON.parse((r && r.dados) || '[]'); } catch (e) {}
+    lista.unshift({ title: P.projectTitle, projectTitle: P.projectTitle, date: dataBr, category: 'Outros', catResumo: P.catResumo, catEscopo: P.catEscopo, catTimeline: P.catTimeline, catInvestimento: P.catInvestimento, catExcluido: P.catExcluido, catPerguntas: P.catPerguntas, valor: Number(String(valor).replace(/[^\d,]/g, '').replace(',', '.')) || 0, linkId: linkId || undefined, linkStatus: linkId ? 'enviada' : undefined, linkVersao: linkId ? 1 : undefined, origem: 'whatsapp' });
+    await env.DB.prepare('INSERT INTO historico (codigo, dados, atualizado_em) VALUES (?, ?, ?) ON CONFLICT(codigo) DO UPDATE SET dados = excluded.dados, atualizado_em = excluded.atualizado_em').bind(u.codigo, JSON.stringify(lista.slice(0, 300)), agora).run();
+  } catch (e) {}
+
+  const resumo = '*' + P.projectTitle + '*' + (valor ? '\nInvestimento: ' + valor : '') + '\n\n' + P.catResumo.slice(0, 600);
+  if (linkId) {
+    return waEnviar(env, tel, 'Proposta pronta!\n\n' + resumo + '\n\nLink para o cliente ver e aprovar:\n' + WORKER_URL + '/p/' + linkId + '\n\nQuer ajustar antes? Abra em https://briefly.app.br/app , em Minhas propostas.\nCréditos restantes: ' + sp.credits);
+  }
+  return waEnviar(env, tel, 'Proposta pronta!\n\n' + resumo + '\n\nA proposta completa, com escopo, etapas e PDF, já está em Minhas propostas: https://briefly.app.br/app\nNos planos pagos você recebe aqui o link para o cliente aprovar pelo celular.\nCréditos restantes: ' + sp.credits);
+}
+async function rotaWhatsapp(request, env, ctx) {
+  const url = new URL(request.url);
+  if (request.method === 'GET') {
+    if (url.searchParams.get('hub.mode') === 'subscribe' && env.WA_VERIFY_TOKEN && url.searchParams.get('hub.verify_token') === env.WA_VERIFY_TOKEN) return new Response(url.searchParams.get('hub.challenge') || '', { status: 200 });
+    return new Response('forbidden', { status: 403 });
+  }
+  const corpo = await request.text();
+  if (!(await waAssinaturaOk(request, env, corpo))) return new Response('assinatura', { status: 401 });
+  let b = {}; try { b = JSON.parse(corpo); } catch (e) {}
+  const v = (((b.entry || [])[0] || {}).changes || [])[0];
+  const val = (v && v.value) || {};
+  const msg = (val.messages || [])[0];
+  if (msg) {
+    const nome = (((val.contacts || [])[0] || {}).profile || {}).name || '';
+    const job = waProcessar(env, msg, nome).catch(() => {});
+    if (ctx && ctx.waitUntil) ctx.waitUntil(job); else await job;
+  }
+  return new Response('ok', { status: 200 });
+}
+
+// ---------- histórico na nuvem (abre em qualquer aparelho) ----------
+async function histTabela(env) {
+  await env.DB.prepare('CREATE TABLE IF NOT EXISTS historico (codigo TEXT PRIMARY KEY, dados TEXT, atualizado_em TEXT)').run();
+}
+async function histCarregar(env, { code }) {
+  const codigo = String(code || '').toUpperCase().trim();
+  if (!codigo) return json({ ok: false, itens: [] });
+  const u = await porCodigo(env.DB, codigo);
+  if (!u) return json({ ok: false, itens: [], motivo: 'Código inválido.' });
+  await histTabela(env);
+  const r = await env.DB.prepare('SELECT dados, atualizado_em FROM historico WHERE codigo = ?').bind(codigo).first();
+  let itens = []; try { itens = JSON.parse((r && r.dados) || '[]'); } catch (e) {}
+  return json({ ok: true, itens: Array.isArray(itens) ? itens : [], atualizado: r ? r.atualizado_em : null });
+}
+async function histSalvar(env, { code, itens }) {
+  const codigo = String(code || '').toUpperCase().trim();
+  if (!codigo || !Array.isArray(itens)) return json({ ok: false });
+  const u = await porCodigo(env.DB, codigo);
+  if (!u) return json({ ok: false, motivo: 'Código inválido.' });
+  await histTabela(env);
+  let lista = itens.slice(0, 300), txt = JSON.stringify(lista);
+  while (txt.length > 900000 && lista.length > 10) { lista = lista.slice(0, Math.floor(lista.length * 0.8)); txt = JSON.stringify(lista); }
+  const agora = new Date().toISOString();
+  await env.DB.prepare('INSERT INTO historico (codigo, dados, atualizado_em) VALUES (?, ?, ?) ON CONFLICT(codigo) DO UPDATE SET dados = excluded.dados, atualizado_em = excluded.atualizado_em').bind(codigo, txt, agora).run();
+  return json({ ok: true, total: lista.length, atualizado: agora });
+}
+
 // ---------- proposta por link (o cliente vê e aprova) ----------
 const LINK_URL = 'https://briefly.app.br/p/?';
 const WORKER_URL = 'https://restless-cherry-a5e5prabriefly-api.joandersantos.workers.dev';
-const OG_PADRAO = 'https://briefly.app.br/og-briefly.png';
+const OG_PADRAO = 'https://briefly.app.br/og-proposta.png';
 const LINK_DIAS = 60;
 const LINK_SO_PAGO = true; // false libera o link também no plano grátis
 let linkTabelaOk = false;
@@ -164,10 +372,10 @@ async function linkPrevia(env, id) {
   const og = d.og || {};
   const titulo = og.titulo || ('Sua proposta está pronta' + (d.designerName ? ' · ' + d.designerName : ''));
   const texto = og.texto || ((d.projectTitle ? d.projectTitle + '. ' : '') + 'Toque para ver o escopo, as etapas e o investimento, e aprovar pelo celular.');
-  const img = (og.imagem || d.logoSrc) ? WORKER_URL + '/og/' + encodeURIComponent(id) : OG_PADRAO;
+  const img = /^https:\/\//.test(og.imagem || '') ? og.imagem : OG_PADRAO;
   const html = '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>' + esc(titulo) + '</title>'
     + '<meta property="og:type" content="website"><meta property="og:title" content="' + esc(titulo) + '"><meta property="og:description" content="' + esc(texto) + '">'
-    + '<meta property="og:image" content="' + img + '"><meta property="og:url" content="' + WORKER_URL + '/p/' + esc(id) + '"><meta name="twitter:card" content="summary_large_image"><meta name="robots" content="noindex">'
+    + '<meta property="og:image" content="' + esc(img) + '"><meta property="og:url" content="' + WORKER_URL + '/p/' + esc(id) + '"><meta name="twitter:card" content="summary_large_image"><meta name="robots" content="noindex">'
     + '<meta http-equiv="refresh" content="0;url=' + destino + '"></head><body style="font-family:Arial,sans-serif;padding:40px;text-align:center"><a href="' + destino + '">Abrir a proposta</a><script>location.replace(' + JSON.stringify(destino) + ')<\/script></body></html>';
   return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' } });
 }
@@ -231,7 +439,7 @@ async function linkAvisar(env, r, assunto, corpo) {
   const html = '<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;background:#ffffff;border:1px solid #eee;border-radius:16px;overflow:hidden">'
     + '<div style="background:' + AZUL + ';color:#ffffff;padding:22px 24px;font-size:20px;font-weight:bold">' + esc(assunto) + '</div>'
     + '<div style="padding:24px;color:#333;font-size:15px;line-height:1.6">' + corpo
-    + '<div style="margin-top:22px"><a href="' + APP_URL + '" style="background:#0e0d0c;color:#ffffff;text-decoration:none;padding:13px 24px;border-radius:999px;font-weight:bold;display:inline-block">Abrir o Briefly</a></div></div></div>';
+    + '<div style="margin-top:22px"><a href="' + APP_URL + (APP_URL.indexOf('?') > -1 ? '&' : '?') + 'abrir=' + encodeURIComponent(r.id) + '" style="background:#0e0d0c;color:#ffffff;text-decoration:none;padding:13px 24px;border-radius:999px;font-weight:bold;display:inline-block">Abrir esta proposta</a></div></div></div>';
   try { await enviarEmail(env, { para, assunto, html }); await env.DB.prepare('UPDATE propostas_link SET aviso_ok = 1, aviso_erro = NULL WHERE id = ?').bind(r.id).run(); }
   catch (e) { await env.DB.prepare('UPDATE propostas_link SET aviso_ok = 0, aviso_erro = ? WHERE id = ?').bind(String(e.message || e).slice(0, 200), r.id).run(); }
 }
@@ -291,6 +499,8 @@ async function enviarEmail(env, { para, assunto, html }) {
       replyTo: { email: RESPONDER_PARA, name: 'Briefly' },
       subject: assunto,
       htmlContent: semAcentoQuebrado(html),
+      textContent: String(html).replace(/<br\s*\/?>/gi, '\n').replace(/<\/(p|div|h[1-6]|li)>/gi, '\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/\n{3,}/g, '\n\n').trim(),
+      headers: { 'X-Entity-Ref-ID': String(Date.now()) },
     }),
   });
   if (!r.ok) {
@@ -447,22 +657,29 @@ async function acaoSpend(env, { code, refund }) {
   if (expirou(u.expira_em)) return json({ ok: false, motivo: 'Seus créditos expiraram.', credits: 0 });
 
   const agora = new Date().toISOString();
+  await debTabela(env);
 
   if (refund) {
-    await fidelidade(env, u, -1);
-    const novo = u.creditos + 1;
-    await env.DB.prepare(
-      'UPDATE usuarios SET creditos = ?, total_gerado = MAX(0, total_gerado - 1), atualizado_em = ? WHERE codigo = ?'
-    ).bind(novo, agora, codigo).run();
-    return json({ ok: true, credits: novo });
+    // Só devolve um débito real, recente e que ainda não virou proposta.
+    // Antes dava para pedir devolução sem limite e ganhar créditos infinitos.
+    const lim = Math.floor(Date.now() / 1000) - 900;
+    const d = await env.DB.prepare("SELECT id FROM debitos WHERE codigo = ? AND estado = 'aberto' AND criado_em > ? ORDER BY criado_em DESC LIMIT 1").bind(codigo, lim).first();
+    if (!d) return json({ ok: false, motivo: 'Nada para devolver.', credits: u.creditos });
+    const novo = await devolverDebito(env, d.id, 'aberto');
+    return json({ ok: true, credits: novo === null ? u.creditos : novo });
   }
 
   if (u.creditos <= 0) return json({ ok: false, motivo: '', credits: 0 });
 
+  // Débito atômico: só desconta se ainda houver crédito (evita saldo negativo
+  // com dois pedidos ao mesmo tempo).
+  const deb = await env.DB.prepare(
+    'UPDATE usuarios SET creditos = creditos - 1, total_gerado = total_gerado + 1, atualizado_em = ? WHERE codigo = ? AND creditos > 0'
+  ).bind(agora, codigo).run();
+  if (!deb.meta || deb.meta.changes === 0) return json({ ok: false, motivo: '', credits: 0 });
   let novo = u.creditos - 1;
-  await env.DB.prepare(
-    'UPDATE usuarios SET creditos = ?, total_gerado = total_gerado + 1, atualizado_em = ? WHERE codigo = ?'
-  ).bind(novo, agora, codigo).run();
+  const ticket = linkNovoId();
+  await env.DB.prepare("INSERT INTO debitos (id, codigo, criado_em, estado) VALUES (?, ?, ?, 'aberto')").bind(ticket, codigo, Math.floor(Date.now() / 1000)).run();
 
   // Fidelidade: só para quem já comprou. Gastou 5 no mês, ganha +2 (uma vez por mês).
   const fid = await fidelidade(env, u, +1);
@@ -470,7 +687,28 @@ async function acaoSpend(env, { code, refund }) {
     novo += fid.bonus;
     await env.DB.prepare('UPDATE usuarios SET creditos = ? WHERE codigo = ?').bind(novo, codigo).run();
   }
-  return json({ ok: true, credits: novo, bonus: fid.bonus || 0, fidelidade: fid.info });
+  return json({ ok: true, credits: novo, bonus: fid.bonus || 0, fidelidade: fid.info, ticket });
+}
+
+// ---------- comprovantes de débito ----------
+// aberto = crédito descontado, proposta ainda não gerada
+// gerando = proposta em andamento · usado = proposta entregue · devolvido = crédito voltou
+let debTabelaOk = false;
+async function debTabela(env) {
+  if (debTabelaOk) return;
+  await env.DB.prepare('CREATE TABLE IF NOT EXISTS debitos (id TEXT PRIMARY KEY, codigo TEXT, criado_em INTEGER, estado TEXT)').run();
+  debTabelaOk = true;
+}
+// Devolve o crédito de um débito, uma vez só. Retorna o saldo novo ou null.
+async function devolverDebito(env, id, deEstado) {
+  const m = await env.DB.prepare("UPDATE debitos SET estado = 'devolvido' WHERE id = ? AND estado = ?").bind(id, deEstado).run();
+  if (!m.meta || m.meta.changes === 0) return null;
+  const d = await env.DB.prepare('SELECT codigo FROM debitos WHERE id = ?').bind(id).first();
+  const u = d && await porCodigo(env.DB, d.codigo);
+  if (!u) return null;
+  await fidelidade(env, u, -1);
+  await env.DB.prepare('UPDATE usuarios SET creditos = creditos + 1, total_gerado = MAX(0, total_gerado - 1), atualizado_em = ? WHERE codigo = ?').bind(new Date().toISOString(), u.codigo).run();
+  return u.creditos + 1;
 }
 
 // ---------- Gamificação ----------
@@ -687,9 +925,15 @@ Exemplos de áreas diferentes:
 - Site responsivo | 5 páginas adaptadas a celular e computador
 
 BLOCO 4 - PRAZO E ETAPAS:
+Não existe número fixo de etapas. A quantidade segue o tamanho real do que o cliente pediu:
+- Serviço simples ou pontual (um ensaio, uma arte, um post, uma consultoria, um evento pequeno): 2 a 4 etapas
+- Projeto médio (site institucional, identidade visual, vídeo curto, festa, pacote mensal simples): 4 a 6 etapas
+- Projeto grande ou longo (sistema, aplicativo, evento grande, obra, várias frentes ao mesmo tempo): 6 a 10 etapas
+Cada etapa é um momento real do trabalho, com uma entrega ou uma decisão do cliente. Não quebre uma etapa em várias só para encher a lista. Nunca passe de 10.
+A soma das durações deve dar um prazo total realista para esse serviço.
 Liste cada etapa em uma linha no formato:
 [Número]. [Nome da Etapa] | [Duração] | [Descrição curta]
-Exemplo:
+Exemplo (serviço pequeno, 4 etapas):
 1. Reunião de alinhamento | 1 dia | Briefing, referências e cronograma
 2. Execução | 1 dia | Realização do serviço contratado
 3. Pós-produção | 15 dias | Tratamento e organização do material
@@ -705,6 +949,12 @@ DESCONTO: [percentual se aplicável, senão "0%"]
 FINAL: R$ [valor final com desconto]
 PAGAMENTO: [condições - ex: 50% entrada + 50% entrega]
 PARCELAMENTO: [opção de parcelamento - ex: ou 3x de R$ X]
+Como chegar nos valores:
+- Estime as horas reais de cada serviço (incluindo reuniões, revisões e entrega) e multiplique pelo valor-hora praticado hoje no Brasil para essa área e para o nível do profissional. Para serviços cobrados por diária, pacote ou cobertura (foto, vídeo, eventos), use o preço de mercado do pacote equivalente.
+- Os serviços do investimento correspondem ao escopo e às etapas: nada cobrado fora do escopo e nada do escopo sem custo.
+- Serviço pequeno tem valor de serviço pequeno: não infle com itens desnecessários. Projeto grande não pode sair barato demais.
+- TOTAL é exatamente a soma dos serviços, e FINAL é o TOTAL menos o desconto. Confira a conta antes de responder.
+- Use valores redondos, como um profissional escreveria (R$ 850, R$ 2.400).
 
 BLOCO 6 - O QUE NÃO ESTÁ INCLUÍDO:
 Liste cada item em uma linha com "- " no início, coerente com a área
@@ -723,6 +973,41 @@ async function acaoGenerate(env, payload) {
   if (msg.length < 20) return json({ error: 'Briefing muito curto para gerar uma proposta.' }, 400);
   if (msg.length > 8000) return json({ error: 'Briefing muito longo. Resuma o essencial do pedido.' }, 400);
 
+  // Gerar exige código ativo e um crédito. Antes o servidor gerava para
+  // qualquer um que chamasse direto, e a conta da geração ficava com você.
+  const codigo = String(payload.code || '').toUpperCase().trim();
+  const u = codigo ? await porCodigo(env.DB, codigo) : null;
+  if (!u) return json({ error: 'Entre no Briefly de novo para gerar a proposta.' }, 401);
+  if (u.status !== 'ativo') return json({ error: 'Este código foi bloqueado.' }, 403);
+  if (expirou(u.expira_em)) return json({ error: 'Seus créditos expiraram.' }, 403);
+
+  // Usa o débito que o app acabou de fazer; se não houver, debita agora.
+  await debTabela(env);
+  let debId = '';
+  const aberto = await env.DB.prepare("SELECT id FROM debitos WHERE codigo = ? AND estado = 'aberto' AND criado_em > ? ORDER BY criado_em DESC LIMIT 1").bind(codigo, Math.floor(Date.now() / 1000) - 900).first();
+  if (aberto) {
+    const m = await env.DB.prepare("UPDATE debitos SET estado = 'gerando' WHERE id = ? AND estado = 'aberto'").bind(aberto.id).run();
+    if (m.meta && m.meta.changes === 1) debId = aberto.id;
+  }
+  if (!debId) {
+    const sp = await (await acaoSpend(env, { code: codigo })).json();
+    if (!sp.ok || !sp.ticket) return json({ error: 'Seus créditos acabaram.', semCredito: true }, 402);
+    await env.DB.prepare("UPDATE debitos SET estado = 'gerando' WHERE id = ?").bind(sp.ticket).run();
+    debId = sp.ticket;
+  }
+  try {
+    const r = await gerarProposta(env, payload, msg);
+    await (r.status === 200
+      ? env.DB.prepare("UPDATE debitos SET estado = 'usado' WHERE id = ?").bind(debId).run()
+      : devolverDebito(env, debId, 'gerando'));
+    return r;
+  } catch (e) {
+    await devolverDebito(env, debId, 'gerando');
+    throw e;
+  }
+}
+
+async function gerarProposta(env, payload, msg) {
   const area = String(payload.area || '').slice(0, 40);
   const orcamentoDe = String(payload.orcamentoDe || '').slice(0, 120).trim();
 
@@ -768,6 +1053,7 @@ async function acaoGenerate(env, payload) {
 // Transcrição de áudio.
 async function acaoTranscribe(env, { audio }) {
   if (!audio || !audio.data) return json({ error: 'Áudio ausente.' }, 400);
+  if (String(audio.data).length > 21000000) return json({ error: 'Áudio muito longo. Envie até uns 10 minutos.' }, 413);
 
   const g = await gemini(env, {
     systemInstruction: {
@@ -832,9 +1118,9 @@ async function acaoRecover(env, { email }) {
     }),
   });
 
-  // Devolve o código na resposta também: assim a pessoa entra na hora,
-  // sem depender do email chegar.
-  return json({ ok: true, codigo: u.codigo, creditos: u.creditos, premium: ehPro });
+  // O código vai SÓ por email. Devolver na tela deixava qualquer pessoa que
+  // soubesse o email de alguém entrar na conta dela.
+  return json({ ok: true, enviado: true, motivo: 'Enviamos seu código para ' + e + '. Confira a caixa de entrada, o spam e a aba Promoções.' });
 }
 
 // Painel de admin — lista os usuários.
@@ -1513,6 +1799,17 @@ async function webhookAsaas(request, env) {
   }
   if (!pag.id) return json({ ok: true, ignorado: 'sem id de pagamento' });
 
+  // Segunda trava: confere o pagamento direto no Asaas. O que vale é o que a
+  // API diz (status e valor), não o que veio no corpo do aviso.
+  let conf = null;
+  try {
+    const rc = await fetch(ASAAS_BASE + '/payments/' + encodeURIComponent(pag.id), { headers: cabAsaas(env) });
+    if (rc.ok) conf = await rc.json();
+  } catch (e) {}
+  if (!conf) return json({ ok: false, erro: 'não consegui confirmar no Asaas' }, 503);
+  if (['RECEIVED', 'CONFIRMED', 'RECEIVED_IN_CASH'].indexOf(conf.status) < 0) return json({ ok: false, ignorado: 'pagamento não confirmado no Asaas' });
+  Object.assign(pag, { value: conf.value, externalReference: conf.externalReference, paymentLink: conf.paymentLink, customer: conf.customer || pag.customer });
+
   const email = String(pag.customerEmail || '').trim()
     || await emailDoClienteAsaas(env, pag.customer);
 
@@ -1614,13 +1911,105 @@ async function varrer(env, horas) {
     : await varredura(env, horas);
 }
 
+
+// ---------- proteção: limite de tentativas ----------
+// Contadores por IP, email e código numa tabela pequena do D1. Se a tabela
+// falhar por qualquer motivo, deixa passar: proteção não pode derrubar o app.
+let limTabelaOk = false;
+async function limTabela(env) {
+  if (limTabelaOk) return;
+  await env.DB.prepare('CREATE TABLE IF NOT EXISTS limites (chave TEXT PRIMARY KEY, n INTEGER, inicio INTEGER)').run();
+  limTabelaOk = true;
+}
+// Conta uma tentativa. Devolve false se passou do limite na janela.
+async function limite(env, chave, max, segundos) {
+  try {
+    await limTabela(env);
+    const agora = Math.floor(Date.now() / 1000);
+    const r = await env.DB.prepare('SELECT n, inicio FROM limites WHERE chave = ?').bind(chave).first();
+    if (!r || agora - r.inicio >= segundos) {
+      await env.DB.prepare('INSERT INTO limites (chave, n, inicio) VALUES (?, 1, ?) ON CONFLICT(chave) DO UPDATE SET n = 1, inicio = excluded.inicio').bind(chave, agora).run();
+      return true;
+    }
+    if (r.n >= max) return false;
+    await env.DB.prepare('UPDATE limites SET n = n + 1 WHERE chave = ?').bind(chave).run();
+    return true;
+  } catch (e) { return true; }
+}
+// Só consulta, sem contar.
+async function estourou(env, chave, max, segundos) {
+  try {
+    await limTabela(env);
+    const r = await env.DB.prepare('SELECT n, inicio FROM limites WHERE chave = ?').bind(chave).first();
+    return !!r && Math.floor(Date.now() / 1000) - r.inicio < segundos && r.n >= max;
+  } catch (e) { return false; }
+}
+const devagar = () => json({ ok: false, valid: false, motivo: 'Muitas tentativas seguidas. Espere alguns minutos e tente de novo.', error: 'Muitas tentativas seguidas. Espere alguns minutos e tente de novo.' }, 429);
+
+const ACOES_EMAIL = new Set(['signup', 'recover', 'login-link', 'ge-entrar']);
+const ACOES_CODIGO = new Set(['validate', 'spend', 'generate', 'transcribe', 'exportou', 'hist-carregar', 'hist-salvar', 'link-salvar', 'link-status', 'ge-validate']);
+const ACOES_ADMIN = new Set(['admin', 'sync', 'admin-lista', 'admin-salvar', 'admin-modelos', 'admin-modelo-salvar', 'admin-modelo-apagar', 'admin-enviar', 'admin-reenviar']);
+const ACOES_CLIENTE = new Set(['link-aprovar', 'link-ajuste', 'link-recusar']);
+
+// Devolve uma resposta de bloqueio, ou null para seguir normalmente.
+async function protecao(env, request, acao, p) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'sem-ip';
+
+  // Emails: ninguém consegue disparar código sem parar para qualquer endereço.
+  if (ACOES_EMAIL.has(acao)) {
+    const e = normalizarEmail(p.email);
+    if (!(await limite(env, 'mail-ip:' + ip, 8, 3600))) return devagar();
+    if (e && !(await limite(env, 'mail:' + e, 4, 3600))) return devagar();
+  }
+
+  // Painel: 10 senhas erradas por hora e o IP fica de fora.
+  if (ACOES_ADMIN.has(acao)) {
+    if (await estourou(env, 'adm:' + ip, 10, 3600)) return devagar();
+    if (!adminOk(env, p.key)) { await limite(env, 'adm:' + ip, 10, 3600); return json({ ok: false }, 403); }
+  }
+
+  // Códigos: quem erra 20 códigos numa hora para de tentar (impede adivinhar).
+  if (ACOES_CODIGO.has(acao) && p.code) {
+    if (await estourou(env, 'falha:' + ip, 20, 3600)) return devagar();
+    const c = String(p.code).toUpperCase().trim();
+    let existe = null;
+    if (acao === 'ge-validate') { await geTabelas(env); existe = await gePorCodigo(env.DB, c); }
+    else existe = await porCodigo(env.DB, c);
+    if (!existe) await limite(env, 'falha:' + ip, 20, 3600);
+    else if ((acao === 'generate' || acao === 'transcribe') && !(await limite(env, acao + ':' + c, 40, 3600))) return devagar();
+  }
+
+  // Transcrição: exige código válido. Versões antigas do app não mandam o
+  // código; para elas, só um limite apertado por IP até atualizarem.
+  if (acao === 'transcribe') {
+    if (p.code) {
+      const u = await porCodigo(env.DB, String(p.code).toUpperCase().trim());
+      if (!u || u.status !== 'ativo') return json({ error: 'Entre no Briefly de novo para enviar áudio.' }, 401);
+    } else if (!(await limite(env, 'tr-ip:' + ip, 6, 3600))) return devagar();
+  }
+
+  // Cliente no link: no máximo 10 respostas por proposta por hora.
+  if (ACOES_CLIENTE.has(acao) && !(await limite(env, 'cli:' + String(p.id || '') + ':' + ip, 10, 3600))) return devagar();
+
+  return null;
+}
+
 // ---------- entrada ----------
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS });
 
     const url = new URL(request.url);
+
+    if (url.pathname === '/whatsapp') {
+      try { return await rotaWhatsapp(request, env, ctx); }
+      catch (e) { return new Response('ok', { status: 200 }); }
+    }
+    if (url.pathname === '/manychat' && request.method === 'POST') {
+      try { return await rotaManychat(request, env); }
+      catch (e) { return json({ ok: false, status: 'erro', mensagem: 'Tive um problema aqui. Tente de novo em instantes.' }); }
+    }
 
     // Cada gateway posta no formato dele, então cada um tem rota própria.
     if (url.pathname === '/asaas' || url.pathname === '/asaas-webhook') {
@@ -1659,6 +2048,8 @@ export default {
     const acao = payload.action || (payload.audio ? 'transcribe' : 'generate');
 
     try {
+      const barrado = await protecao(env, request, acao, payload);
+      if (barrado) return barrado;
       switch (acao) {
         case 'signup':     return await acaoSignup(env, payload);
         case 'validate':   return await acaoValidate(env, payload);
@@ -1688,10 +2079,13 @@ export default {
         case 'link-ajuste':    return await linkAjuste(env, payload);
         case 'link-recusar':   return await linkRecusar(env, payload);
         case 'link-status':    return await linkStatus(env, payload);
+        case 'hist-carregar':  return await histCarregar(env, payload);
+        case 'hist-salvar':    return await histSalvar(env, payload);
         default:           return json({ error: 'Ação desconhecida: ' + acao }, 400);
       }
     } catch (e) {
-      return json({ error: e.message || String(e) }, 500);
+      console.error('erro em ' + acao, e);
+      return json({ error: 'Tive um problema aqui. Tente de novo em instantes.' }, 500);
     }
   },
 
