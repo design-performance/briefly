@@ -1,0 +1,33 @@
+name: Publicar servidor (Cloudflare)
+
+# Sempre que o código do servidor (pasta worker/) muda no GitHub,
+# este robô publica a versão nova no Worker da Cloudflare.
+# A chave fica guardada em Settings > Secrets > CLOUDFLARE_API_TOKEN
+# e só consegue publicar este Worker.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'worker/**'
+      - '.github/workflows/publicar-worker.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: publicar-worker
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Publicar na Cloudflare
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 5dfafa477cb2604db1931690e3302ed6
+        run: npx --yes wrangler@4 deploy
